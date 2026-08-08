@@ -56,8 +56,10 @@ check_dependencies() {
     command -v colab >/dev/null \
         || error "Colab CLI não encontrado"
 
-    command -v ffmpeg >/dev/null \
-        || error "ffmpeg não encontrado"
+    if [ "${USE_VIDEO:-0}" -eq 0 ]; then
+        command -v ffmpeg >/dev/null \
+            || error "ffmpeg não encontrado"
+    fi
 
 }
 
@@ -262,34 +264,39 @@ ensure_whisper() {
 
 prepare_audio() {
 
-    INPUT="$1"
-    NAME="${INPUT%.*}"
-
-    AUDIO="${NAME}.opus"
+    local input="$1"
+    local name="${input%.*}"
+    local audio="${name}.opus"
 
     info "Convertendo áudio para Opus..."
 
-    if [ -f "$AUDIO" ]; then
+    if [ -f "$audio" ]; then
 
         info "Áudio já convertido, pulando..."
 
-        return
+        return 0
 
     fi
 
 
-    ffmpeg \
-        -i "$INPUT" \
+    if ! ffmpeg \
+        -i "$input" \
         -vn \
         -ac 1 \
         -ar 16000 \
         -c:a libopus \
         -b:a 32k \
-        "$AUDIO" \
-        -y
+        "$audio" \
+        -y; then
+
+        warn "Falha na conversão FFmpeg para: $input"
+
+        return 1
+
+    fi
 
 
-    ok "Criado: $AUDIO"
+    ok "Criado: $audio"
 
 }
 
@@ -411,7 +418,9 @@ EOF
 
             rm -rf "$tmp_dir"
 
-            error "Upload falhou no chunk: $failed_chunk"
+            warn "Upload falhou no chunk: $failed_chunk"
+
+            return 1
 
         fi
 
@@ -423,7 +432,7 @@ EOF
     trap - EXIT INT TERM
 
 
-    info "Reconstruindo áudio no Colab..."
+    info "Reconstruindo arquivo no Colab..."
 
 
     cat > /tmp/reconstruct.py <<EOF
@@ -454,7 +463,9 @@ EOF
 
     if ! echo "$rec_result" | grep -q "reconstructed"; then
 
-        error "Falha ao reconstruir áudio no Colab"
+        warn "Falha ao reconstruir arquivo no Colab"
+
+        return 1
 
     fi
 
@@ -468,8 +479,12 @@ EOF
 
 create_remote_script() {
 
+    local target_media="$1"
+    local target_srt="$2"
+    local target_txt="${3:-}"
+    local gen_txt="${4:-0}"
 
-REMOTE_SCRIPT="transcribe_remote.py"
+    REMOTE_SCRIPT="transcribe_remote.py"
 
 
 cat > "$REMOTE_SCRIPT" <<EOF
@@ -477,14 +492,19 @@ from faster_whisper import WhisperModel
 import os
 
 
-audio="/content/$(basename "$AUDIO")"
+media_file="/content/$(basename "$target_media")"
 
-output="/content/$(basename "$SRT")"
+output_srt="/content/$(basename "$target_srt")"
+
+gen_txt = ${gen_txt}
+
+output_txt = "/content/$(basename "$target_txt")" if gen_txt and "$target_txt" else ""
 
 
 
-if not os.path.exists(audio):
-    raise FileNotFoundError(audio)
+if not os.path.exists(media_file):
+
+    raise FileNotFoundError(media_file)
 
 
 
@@ -503,7 +523,7 @@ print("Transcrevendo...")
 
 
 segments, info = model.transcribe(
-    audio,
+    media_file,
     language="pt",
     beam_size=5,
     vad_filter=True
@@ -525,25 +545,44 @@ def tempo(segundos):
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
+srt_lines = []
+txt_lines = []
 
-with open(output,"w",encoding="utf-8") as f:
+for i, seg in enumerate(segments, 1):
 
+    text = seg.text.strip()
 
-    for i,seg in enumerate(segments,1):
+    if text:
 
-        f.write(
+        srt_lines.append(
             f"{i}\\n"
             f"{tempo(seg.start)} --> {tempo(seg.end)}\\n"
-            f"{seg.text.strip()}\\n\\n"
+            f"{text}\\n\\n"
         )
 
+        txt_lines.append(text)
 
-print("Criado:", output)
+
+with open(output_srt, "w", encoding="utf-8") as f:
+
+    f.writelines(srt_lines)
+
+
+print("Criado:", output_srt)
+
+
+if gen_txt and output_txt:
+
+    with open(output_txt, "w", encoding="utf-8") as f:
+
+        f.write("\\n".join(txt_lines) + "\\n")
+
+    print("Criado:", output_txt)
 
 EOF
 
 
-ok "Script remoto criado"
+    ok "Script remoto criado"
 
 }
 
@@ -557,24 +596,38 @@ run_whisper() {
     info "Enviando script Whisper..."
 
 
-    colab upload \
+    if ! colab upload \
         -s "$SESSION" \
         "$REMOTE_SCRIPT" \
-        "/content/$REMOTE_SCRIPT"
+        "/content/$REMOTE_SCRIPT"; then
+
+        warn "Falha ao enviar script Whisper"
+
+        return 1
+
+    fi
 
 
 
     info "Rodando Whisper na T4..."
 
 
-    colab exec \
+    if ! colab exec \
         -s "$SESSION" \
         -f "$REMOTE_SCRIPT" \
-        --timeout 7200
+        --timeout 7200; then
+
+        warn "Erro na execução do Whisper no Colab"
+
+        return 1
+
+    fi
 
 
 
     ok "Transcrição finalizada"
+
+    return 0
 
 }
 
@@ -586,18 +639,61 @@ run_whisper() {
 
 download_srt() {
 
+    local target_srt="$1"
 
-    info "Baixando legenda..."
+
+    info "Baixando legenda (.srt)..."
 
 
-    colab download \
+    if ! colab download \
         -s "$SESSION" \
-        "/content/$(basename "$SRT")" \
-        "$SRT"
+        "/content/$(basename "$target_srt")" \
+        "$target_srt"; then
+
+        warn "Falha ao baixar legenda de $target_srt"
+
+        return 1
+
+    fi
 
 
 
-    ok "Legenda salva: $SRT"
+    ok "Legenda salva: $target_srt"
+
+    return 0
+
+}
+
+
+
+########################################
+# Baixar texto (.txt)
+########################################
+
+download_txt() {
+
+    local target_txt="$1"
+
+
+    info "Baixando texto (.txt)..."
+
+
+    if ! colab download \
+        -s "$SESSION" \
+        "/content/$(basename "$target_txt")" \
+        "$target_txt"; then
+
+        warn "Falha ao baixar texto de $target_txt"
+
+        return 1
+
+    fi
+
+
+
+    ok "Texto salvo: $target_txt"
+
+    return 0
 
 }
 
@@ -609,18 +705,25 @@ download_srt() {
 
 remote_cleanup() {
 
+    local target_media="$1"
+    local target_srt="$2"
+    local target_txt="${3:-}"
 
-    info "Limpando arquivos temporários..."
+
+    info "Limpando arquivos temporários no Colab..."
 
 
     cat > /tmp/cleanup.py <<EOF
 import os
 
 files = [
-    "/content/$(basename "$AUDIO")",
-    "/content/$(basename "$SRT")",
+    "/content/$(basename "$target_media")",
+    "/content/$(basename "$target_srt")",
     "/content/$REMOTE_SCRIPT"
 ]
+
+if "$target_txt":
+    files.append("/content/$(basename "$target_txt")")
 
 
 for f in files:
@@ -640,6 +743,112 @@ EOF
         --timeout 60 \
         >/dev/null 2>&1 || true
 
+    rm -f /tmp/cleanup.py
+    rm -f "$REMOTE_SCRIPT" 2>/dev/null || true
+
+}
+
+
+########################################
+# Processar arquivo individual
+########################################
+
+process_single_file() {
+
+    local input_file="$1"
+    local name="${input_file%.*}"
+    local srt="${name}.srt"
+    local txt="${name}.txt"
+    local media_file=""
+    local audio=""
+
+    if [ -f "$srt" ] && { [ "$GENERATE_TXT" -eq 0 ] || [ -f "$txt" ]; }; then
+
+        info "Saída(s) já existente(s) para $(basename "$input_file"). Pulando..."
+
+        return 0
+
+    fi
+
+    if [ "$USE_VIDEO" -eq 1 ]; then
+
+        media_file="$input_file"
+
+        info "Modo vídeo: enviando $(basename "$input_file") diretamente..."
+
+    else
+
+        audio="${name}.opus"
+
+        if ! prepare_audio "$input_file"; then
+
+            warn "Falha ao preparar áudio para: $input_file. Pulando..."
+
+            return 1
+
+        fi
+
+        media_file="$audio"
+
+    fi
+
+    if ! upload_parallel "$SESSION" "$media_file" "/content/$(basename "$media_file")"; then
+
+        warn "Falha no upload para: $media_file. Pulando..."
+
+        [ "$USE_VIDEO" -eq 0 ] && rm -f "$audio" 2>/dev/null || true
+
+        return 1
+
+    fi
+
+    create_remote_script "$media_file" "$srt" "$txt" "$GENERATE_TXT"
+
+    if ! run_whisper; then
+
+        warn "Falha na transcrição de: $input_file. Pulando..."
+
+        remote_cleanup "$media_file" "$srt" "$txt"
+
+        [ "$USE_VIDEO" -eq 0 ] && rm -f "$audio" 2>/dev/null || true
+
+        return 1
+
+    fi
+
+    if ! download_srt "$srt"; then
+
+        warn "Falha ao baixar legenda para: $input_file."
+
+    else
+
+        ok "Legenda gerada com sucesso: $srt"
+
+    fi
+
+    if [ "$GENERATE_TXT" -eq 1 ]; then
+
+        if ! download_txt "$txt"; then
+
+            warn "Falha ao baixar texto para: $input_file."
+
+        else
+
+            ok "Texto gerado com sucesso: $txt"
+
+        fi
+
+    fi
+
+    remote_cleanup "$media_file" "$srt" "$txt"
+
+    if [ "$USE_VIDEO" -eq 0 ] && [ -f "$audio" ]; then
+
+        rm -f "$audio"
+
+    fi
+
+    return 0
 
 }
 
@@ -724,7 +933,18 @@ cat <<EOF
 
 Uso:
 
-  $0 arquivo.ts|arquivo.mp4|arquivo.mkv
+  $0 [-v|--video] [-t|--txt] [-d|--dir] <arquivo|diretorio>
+
+Opções:
+
+  -v, --video
+      Envia o vídeo diretamente para o Whisper (ignora extração FFmpeg local)
+
+  -t, --txt, --text
+      Gera também um arquivo de texto simples (.txt) com a transcrição bruta
+
+  -d, --dir <diretório>
+      Processa todos os arquivos de mídia contidos no diretório especificado
 
 Comandos:
 
@@ -734,9 +954,12 @@ Comandos:
   $0 stop
       Encerra sessão Colab
 
-Exemplo:
+Exemplos:
 
   $0 "Aula 07 - Analise.mp4"
+  $0 -t -v "Aula 07 - Analise.mp4"
+  $0 -t /caminho/para/pasta_videos
+  $0 -v -t -d /caminho/para/pasta_videos
 
 EOF
 
@@ -760,121 +983,209 @@ main() {
     fi
 
 
+    USE_VIDEO=0
+    GENERATE_TXT=0
+    INPUT=""
 
-    COMMAND="$1"
+    while [ $# -gt 0 ]; do
+
+        case "$1" in
+
+            -v|--video)
+
+                USE_VIDEO=1
+
+                shift
+
+            ;;
+
+            -t|--txt|--text)
+
+                GENERATE_TXT=1
+
+                shift
+
+            ;;
+
+            -d|--dir)
+
+                shift
+
+                if [ $# -gt 0 ]; then
+
+                    INPUT="$1"
+
+                    shift
+
+                else
+
+                    error "A opção -d/--dir requer um diretório como argumento"
+
+                fi
+
+            ;;
+
+            status)
+
+                show_status
+
+                exit 0
+
+            ;;
+
+            stop)
+
+                stop_session
+
+                exit 0
+
+            ;;
+
+            -h|--help|help)
+
+                show_help
+
+                exit 0
+
+            ;;
+
+            *)
+
+                if [ -z "$INPUT" ]; then
+
+                    INPUT="$1"
+
+                else
+
+                    error "Opção desconhecida ou múltiplos caminhos fornecidos: $1"
+
+                fi
+
+                shift
+
+            ;;
+
+        esac
+
+    done
 
 
+    if [ -z "$INPUT" ]; then
 
-    case "$COMMAND" in
+        show_help
 
-
-        status)
-
-            show_status
-
-            exit 0
-
-        ;;
-
-
-
-        stop)
-
-            stop_session
-
-            exit 0
-
-        ;;
-
-
-
-        -h|--help|help)
-
-            show_help
-
-            exit 0
-
-        ;;
-
-
-    esac
-
-
-
-    INPUT="$1"
-
-
-
-    if [ ! -f "$INPUT" ]; then
-
-        error "Arquivo não encontrado: $INPUT"
+        exit 1
 
     fi
 
 
+    FILES=()
 
-    NAME="${INPUT%.*}"
+    if [ -d "$INPUT" ]; then
 
-    AUDIO="${NAME}.opus"
+        info "Diretório detectado: $INPUT"
 
-    SRT="${NAME}.srt"
+        info "Buscando arquivos de mídia..."
 
+        while IFS= read -r -d '' file; do
+
+            FILES+=("$file")
+
+        done < <(find "$INPUT" -maxdepth 1 -type f \( \
+            -iname "*.mp4" -o \
+            -iname "*.mkv" -o \
+            -iname "*.mov" -o \
+            -iname "*.avi" -o \
+            -iname "*.ts"  -o \
+            -iname "*.webm" -o \
+            -iname "*.flv" -o \
+            -iname "*.m4v" -o \
+            -iname "*.mp3" -o \
+            -iname "*.wav" -o \
+            -iname "*.m4a" -o \
+            -iname "*.opus" -o \
+            -iname "*.aac" \
+        \) -print0 | sort -z)
+
+        TOTAL=${#FILES[@]}
+
+        if [ "$TOTAL" -eq 0 ]; then
+
+            error "Nenhum arquivo de mídia suportado encontrado em: $INPUT"
+
+        fi
+
+        info "Encontrado(s) $TOTAL arquivo(s) para processar."
+
+    elif [ -f "$INPUT" ]; then
+
+        FILES+=("$INPUT")
+
+        TOTAL=1
+
+    else
+
+        error "Arquivo ou diretório não encontrado: $INPUT"
+
+    fi
 
 
     check_dependencies
 
 
-
     cancel_timer
-
 
 
     ensure_session
 
 
-
     ensure_whisper
 
 
+    SUCCESS_COUNT=0
+    FAIL_COUNT=0
 
-    prepare_audio "$INPUT"
+    for i in "${!FILES[@]}"; do
 
+        CURRENT=$((i + 1))
+        FILE="${FILES[$i]}"
 
+        echo
+        info "=================================================="
+        info "[$CURRENT/$TOTAL] Processando: $(basename "$FILE")"
+        info "=================================================="
 
-    upload_parallel "$SESSION" "$AUDIO" "/content/$(basename "$AUDIO")"
+        if process_single_file "$FILE"; then
 
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
 
+        else
 
-    create_remote_script
+            FAIL_COUNT=$((FAIL_COUNT + 1))
 
+            warn "Falha no arquivo: $FILE"
 
+        fi
 
-    run_whisper
-
-
-
-    download_srt
-
-
-
-    remote_cleanup
-
+    done
 
 
     start_timer
-
 
 
     echo
 
     echo "======================================"
 
-    ok "Concluído!"
+    ok "Processamento concluído!"
 
-    echo
+    echo "Sucessos: $SUCCESS_COUNT / $TOTAL"
 
-    echo "Legenda:"
-    echo "$SRT"
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+
+        warn "Falhas: $FAIL_COUNT / $TOTAL"
+
+    fi
 
     echo
 
