@@ -216,5 +216,13 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Media files
+*.mkv
+*.mp4
+*.avi
+*.mp3
+*.aac
+*.wav
+
 # Streamlit
 .streamlit/secrets.toml
