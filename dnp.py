@@ -6,11 +6,11 @@ Architecture:
   - Up to MAX_CONCURRENT (default 3) magnets downloading to the SSD in
     parallel, each as an asyncio task gated by a Semaphore.
   - Each task: add to qBittorrent → wait for completion → ffprobe →
-    remux via remux.sh → stage the output file in a stable directory → push onto an asyncio.Queue.
+    audio remux via ffmpeg if needed → stage the output file in a stable directory → push onto an asyncio.Queue.
   - A single rsync worker drains the queue, transferring one file at a
     time to the external HDD. We never parallelize rsync; spinning rust
     drives hate it.
-  - All heavy lifting is in external tools (qBittorrent, remux.sh, ffprobe, rsync, flatpak, yt-dlp).
+  - All heavy lifting is in external tools (qBittorrent, ffmpeg, ffprobe, rsync, flatpak, yt-dlp).
     This script is pure orchestration.
 
 Requires Python 3.10+.
@@ -25,7 +25,6 @@ Environment overrides (all optional):
     SSD_BUFFER               default: ~/torrent_buffer
     POLL_INTERVAL            default: 10 (seconds)
     POLL_TIMEOUT             default: 3600 (seconds)
-    REMUX_SCRIPT              default: ~/scripts/remux.sh
 
 CLI:
     download_and_process.py [input_file] [--max-concurrent N] [--test] [--organize] [--dry-run]
@@ -96,7 +95,6 @@ class Config:
     ssd_buffer: Path
     hdd_mount: Path
     hdd_series_dir: Path
-    remux_script: Path
     safety_threshold_gb: int
     min_free_space_gb: int
     qbt_webui_url: str
@@ -114,7 +112,6 @@ def load_config() -> Config:
         ssd_buffer=Path(os.environ.get("SSD_BUFFER", str(Path.home() / "torrent_buffer"))),
         hdd_mount=Path("/media/sam/Videos"),
         hdd_series_dir=Path("/media/sam/Videos/SERIES"),
-        remux_script=Path(os.environ.get("REMUX_SCRIPT", str(Path.home() / "scripts" / "remux.sh"))),
         safety_threshold_gb=int(os.environ.get("SAFETY_THRESHOLD_GB", "4")),
         min_free_space_gb=int(os.environ.get("MIN_FREE_SPACE_GB", "4")),
         qbt_webui_url=os.environ.get("QBT_WEBUI_URL", "http://localhost:8080"),
@@ -911,7 +908,7 @@ async def robust_rsync_to_hdd(src: Path, dest_dir: Path, max_retries: int = 3, d
 
 
 # =============================================================================
-# Media validation (ffprobe) & External remux.sh Integration
+# Media validation (ffprobe) & Local Audio Remux (ffmpeg)
 # =============================================================================
 
 @dataclass
@@ -941,20 +938,99 @@ def _ffprobe_stream(file: Path, stream: str, fields: list[str]) -> dict:
         return {}
 
 
-def _probe_audio_codecs(file: Path) -> list[str]:
+def _probe_audio_streams(file: Path) -> list[dict]:
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "a",
-        "-show_entries", "stream=codec_name",
+        "-show_entries", "stream=index,codec_name,profile",
         "-of", "json",
         str(file),
     ]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
-        streams = json.loads(out.stdout).get("streams", [])
-        return [s.get("codec_name", "unknown").lower() for s in streams]
-    except Exception:
+        return json.loads(out.stdout).get("streams", [])
+    except Exception as e:
+        log.warning("ffprobe audio streams failed (%s): %s", file.name, e)
         return []
+
+
+def _probe_audio_codecs(file: Path) -> list[str]:
+    streams = _probe_audio_streams(file)
+    return [s.get("codec_name", "unknown").lower() for s in streams]
+
+
+def is_audio_codec_supported(codec_name: str, profile: str = "") -> bool:
+    codec = (codec_name or "").lower().strip()
+    prof = (profile or "").lower().strip()
+
+    if codec in ("ac3", "mp2", "mp3"):
+        return True
+
+    if codec == "aac":
+        if any(variant in prof for variant in ["he-aac", "he_aac", "sbr", "eld", "ld"]):
+            return False
+        if not prof or "lc" in prof or "low complexity" in prof:
+            return True
+        return False
+
+    return False
+
+
+def _probe_subtitle_streams(file: Path) -> list[dict]:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "s",
+        "-show_entries", "stream=index,codec_name,disposition:stream_tags=language,title",
+        "-of", "json",
+        str(file),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+        return json.loads(out.stdout).get("streams", [])
+    except Exception as e:
+        log.warning("ffprobe subtitle streams failed (%s): %s", file.name, e)
+        return []
+
+
+def is_subtitle_codec_supported(codec_name: str) -> bool:
+    codec = (codec_name or "").lower().strip()
+    return codec in ("subrip", "mov_text", "text", "ttml", "srt")
+
+
+def filter_subtitle_streams(sub_streams: list[dict], max_subs: int = 3) -> list[dict]:
+    """Filter out unsupported subtitle formats (e.g. ASS/SSA, PGS, VobSub) and
+    limit total subtitle tracks to max_subs (default 3), prioritizing Portuguese,
+    English, default, and forced streams.
+    """
+    valid_subs = [s for s in sub_streams if is_subtitle_codec_supported(s.get("codec_name", ""))]
+    if not valid_subs:
+        return []
+
+    if len(valid_subs) <= max_subs:
+        return valid_subs
+
+    def sub_priority(s: dict) -> tuple[int, int, int]:
+        tags = s.get("tags") or {}
+        lang = (tags.get("language") or "").lower().strip()
+        title = (tags.get("title") or "").lower().strip()
+        disp = s.get("disposition") or {}
+
+        if any(pt in lang or pt in title for pt in ["por", "pt", "pb", "portuguese"]):
+            lang_score = 0
+        elif any(en in lang or en in title for en in ["eng", "en", "english"]):
+            lang_score = 1
+        else:
+            lang_score = 2
+
+        disp_score = 0 if (disp.get("default") or disp.get("forced")) else 1
+        idx_score = s.get("index", 999)
+
+        return (lang_score, disp_score, idx_score)
+
+    sorted_subs = sorted(valid_subs, key=sub_priority)
+    selected = sorted_subs[:max_subs]
+    selected.sort(key=lambda s: s.get("index", 0))
+    return selected
 
 
 def _probe_duration(file: Path) -> float:
@@ -1000,21 +1076,75 @@ def validate_media(file: Path) -> MediaInfo:
 _REMUX_LOCK = asyncio.Lock()
 
 
-async def run_remux_sh(
+async def remux_audio_if_needed(
     video_path: Path, cfg: Config, task_key: Optional[str] = None
 ) -> Optional[Path]:
-    """Delegate remuxing/transcoding to the external remux.sh script.
-    Serialized via _REMUX_LOCK to ensure remux.sh is never triggered in parallel.
+    """Check if audio or subtitle streams need conversion/filtering and remux locally with ffmpeg.
+    
+    Audio Rules:
+    - If audio is AC-3, MP2, MP3, or AAC-LC -> keep it (copy).
+    - If audio is E-AC-3, DTS, DTS-HD, TrueHD, FLAC, Opus, Vorbis, PCM/LPCM,
+      or another unsupported codec -> convert only the audio to AC-3.
+      
+    Subtitle Rules:
+    - Only text subtitles (SubRip/SRT, mov_text, text, ttml) are supported on Plasma TV.
+    - Unsupported subtitles (ASS/SSA, PGS, VobSub, etc.) are removed.
+    - Max 3 subtitle tracks retained (prioritizing Portuguese and English).
+    - Video is NEVER re-encoded (-c:v copy).
     """
-    remux_script = cfg.remux_script
-    if not remux_script.exists():
-        log.error("remux.sh script not found at %s", remux_script)
+    if not video_path.exists():
+        log.error("File for media remux does not exist: %s", video_path)
         return None
 
-    cmd = [str(remux_script), "-w"]
-    if cfg.best_quality:
-        cmd.append("-q")
-    cmd.append(str(video_path))
+    audio_streams = _probe_audio_streams(video_path)
+    sub_streams = _probe_subtitle_streams(video_path)
+
+    stream_codecs = []
+    audio_needs_remux = False
+    for s in audio_streams:
+        c = s.get("codec_name", "")
+        p = s.get("profile", "")
+        supported = is_audio_codec_supported(c, p)
+        stream_codecs.append((c, p, supported))
+        if not supported:
+            audio_needs_remux = True
+
+    selected_subs = filter_subtitle_streams(sub_streams, max_subs=3)
+    sub_needs_remux = len(sub_streams) != len(selected_subs)
+
+    needs_remux = audio_needs_remux or sub_needs_remux
+
+    if not needs_remux:
+        log.info("Audio and subtitle streams in %s are supported, skipping remux.", video_path.name)
+        return video_path
+
+    log.info("Remux needed for %s (audio_remux=%s, sub_remux=%s). Audio: %s, Subs total=%d selected=%d",
+             video_path.name, audio_needs_remux, sub_needs_remux, stream_codecs, len(sub_streams), len(selected_subs))
+
+    out_name = f"{video_path.stem}.remux.mkv"
+    out_path = video_path.with_name(out_name)
+    if out_path.exists() and out_path != video_path:
+        out_path.unlink(missing_ok=True)
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-map", "0:v", "-c:v", "copy"]
+
+    if audio_streams:
+        cmd.extend(["-map", "0:a"])
+        for idx, (c, p, supported) in enumerate(stream_codecs):
+            if supported:
+                cmd.extend([f"-c:a:{idx}", "copy"])
+            else:
+                cmd.extend([f"-c:a:{idx}", "ac3"])
+
+    if not selected_subs:
+        cmd.append("-sn")
+    else:
+        for sub in selected_subs:
+            sub_idx = sub["index"]
+            cmd.extend(["-map", f"0:{sub_idx}"])
+        cmd.extend(["-c:s", "copy"])
+
+    cmd.extend(["-f", "matroska", str(out_path)])
 
     dash = Dashboard.get_instance()
     if task_key:
@@ -1022,52 +1152,33 @@ async def run_remux_sh(
 
     async with _REMUX_LOCK:
         if task_key:
-            dash.update(task_key, TaskStatus.REMUXING, 0.0, "remuxing (remux.sh)")
+            dash.update(task_key, TaskStatus.REMUXING, 0.0, "remuxing media (ffmpeg)")
 
-        log.info("Running remux.sh: %s", " ".join(cmd))
+        log.info("Running ffmpeg media remux: %s", " ".join(cmd))
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            stdout_bytes, stderr_bytes = await proc.communicate()
+            rc = proc.returncode
 
-            async def _read_stdout():
-                while proc.stdout:
-                    line_bytes = await read_until_cr_or_lf(proc.stdout)
-                    if not line_bytes:
-                        break
-                    line = line_bytes.decode("utf-8", errors="ignore").strip()
-                    if line:
-                        log.info("[remux.sh] %s", line)
-
-            async def _read_stderr():
-                while proc.stderr:
-                    line_bytes = await read_until_cr_or_lf(proc.stderr)
-                    if not line_bytes:
-                        break
-                    line = line_bytes.decode("utf-8", errors="ignore").strip()
-                    if line:
-                        log.warning("[remux.sh] %s", line)
-
-            await asyncio.gather(_read_stdout(), _read_stderr())
-            rc = await proc.wait()
-
-            if rc == 0:
-                # remux.sh with -w produces <name>.mkv or overwrites video_path
-                expected_mkv = video_path.with_suffix(".mkv")
-                if expected_mkv.exists():
-                    return expected_mkv
-                elif video_path.exists():
-                    return video_path
-                else:
-                    log.error("remux.sh completed with rc=0 but output file missing")
-                    return None
+            if rc == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                log.info("Media remux successful: %s -> %s", video_path.name, out_path.name)
+                if video_path != out_path:
+                    video_path.unlink(missing_ok=True)
+                return out_path
             else:
-                log.error("remux.sh failed with exit code %d", rc)
+                stderr_msg = stderr_bytes.decode("utf-8", errors="ignore").strip()
+                log.error("ffmpeg media remux failed (rc=%d): %s", rc, stderr_msg)
+                if out_path.exists() and out_path != video_path:
+                    out_path.unlink(missing_ok=True)
                 return None
         except Exception as e:
-            log.error("Failed to execute remux.sh: %s", e)
+            log.error("Failed to execute ffmpeg media remux: %s", e)
+            if out_path.exists() and out_path != video_path:
+                out_path.unlink(missing_ok=True)
             return None
 
 
@@ -1084,6 +1195,9 @@ async def run_ytdlp(args: list[str], task_key: Optional[str] = None) -> tuple[in
             args = ["--js-runtimes", "node"] + args
         elif shutil.which("deno"):
             args = ["--js-runtimes", "deno"] + args
+
+    if "--cookies-from-browser" not in args and shutil.which("google-chrome"):
+        args = ["--cookies-from-browser", "chrome"] + args
 
     cmd = ["yt-dlp"] + args
     log.info("Running: %s", " ".join(cmd))
@@ -1179,7 +1293,7 @@ async def download_youtube(url: str, cfg: Config, task_key: Optional[str] = None
 async def process_youtube_url(
     url: str, index: int, total: int, cfg: Config, hdd_queue: asyncio.Queue
 ) -> bool:
-    """Full YouTube pipeline: download → validate → remux.sh → stage → classify → rsync."""
+    """Full YouTube pipeline: download → validate → audio remux → stage → classify → rsync."""
     dash = Dashboard.get_instance()
     task_key = f"youtube_{index}"
     dash.register(task_key, f"YouTube {index}/{total}")
@@ -1204,10 +1318,10 @@ async def process_youtube_url(
              media_info.width, media_info.height,
              media_info.audio_codecs, media_info.duration)
     
-    dash.update(task_key, TaskStatus.REMUXING, 0.6, "remuxing")
-    remuxed = await run_remux_sh(downloaded, cfg, task_key)
+    dash.update(task_key, TaskStatus.REMUXING, 0.6, "checking audio")
+    remuxed = await remux_audio_if_needed(downloaded, cfg, task_key)
     if not remuxed:
-        log.error("remux.sh failed for YouTube video: %s", downloaded.name)
+        log.error("Audio remux failed for YouTube video: %s", downloaded.name)
         downloaded.unlink(missing_ok=True)
         dash.update(task_key, TaskStatus.FAILED, 0.0, "remux failed")
         return False
@@ -1816,11 +1930,11 @@ async def process_downloaded_file(
         dash.update(file_task_key, TaskStatus.FAILED, 0.0, "validation failed")
         return False
 
-    # --- Remux via remux.sh ---
-    dash.update(file_task_key, TaskStatus.REMUXING, 0.0, "remuxing via remux.sh")
-    remuxed = await run_remux_sh(downloaded, cfg, file_task_key)
+    # --- Audio Remux if needed ---
+    dash.update(file_task_key, TaskStatus.REMUXING, 0.0, "checking audio")
+    remuxed = await remux_audio_if_needed(downloaded, cfg, file_task_key)
     if not remuxed:
-        log.error("remux.sh failed for %s", downloaded.name)
+        log.error("Audio remux failed for %s", downloaded.name)
         dash.update(file_task_key, TaskStatus.FAILED, 0.0, "remux failed")
         return False
 
@@ -2152,7 +2266,7 @@ async def resume_staged_and_processed_transfers(cfg: Config, hdd_queue: asyncio.
 
 
 async def process_buffer(cfg: Config, organize_after: bool = False, dry_run: bool = False) -> tuple[int, int]:
-    """Scan torrent_buffer for unprocessed video files & move to HDD after remuxing via remux.sh."""
+    """Scan torrent_buffer for unprocessed video files & move to HDD after audio remuxing."""
     video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".webm", ".mov", ".ts", ".wmv"}
     skip_subdirs = {"yt-dlp", "ready_for_hdd", "processed", "to_convert"}
     
@@ -2319,10 +2433,10 @@ async def process_buffer(cfg: Config, organize_after: bool = False, dry_run: boo
                  media_info.width, media_info.height,
                  media_info.audio_codecs, media_info.duration)
         
-        dash.update(task_key, TaskStatus.REMUXING, 0.3, "remuxing via remux.sh")
-        remuxed = await run_remux_sh(video_path, cfg, task_key)
+        dash.update(task_key, TaskStatus.REMUXING, 0.3, "checking audio")
+        remuxed = await remux_audio_if_needed(video_path, cfg, task_key)
         if not remuxed:
-            log.error("remux.sh failed for: %s", video_path)
+            log.error("Audio remux failed for: %s", video_path)
             dash.update(task_key, TaskStatus.FAILED, 0.0, "remux failed")
             failed += 1
             continue
@@ -2445,15 +2559,11 @@ async def run_pipeline(cfg: Config, input_file: Path | str, organize_after: bool
             log.error("Input file missing or is a syslink: %s", input_file)
             return 0, 0
 
-    deps = ["ffprobe", "rsync", "flatpak", "yt-dlp"]
+    deps = ["ffmpeg", "ffprobe", "rsync", "flatpak", "yt-dlp"]
     for cmd in deps:
         if not shutil.which(cmd):
             log.error("Missing dependency: %s", cmd)
             return 0, 0
-
-    if not cfg.remux_script.exists():
-        log.error("Missing remux script at %s", cfg.remux_script)
-        return 0, 0
 
     cfg.ssd_buffer.mkdir(parents=True, exist_ok=True)
 
@@ -2736,9 +2846,33 @@ def run_tests() -> bool:
     check("extract_links magnet", extract_links("magnet:?xt=urn:btih:xyz"), [LinkEntry(url="magnet:?xt=urn:btih:xyz", kind="magnet")])
     check("extract_links youtube", extract_links("https://www.youtube.com/watch?v=MRcjGT85OXY"), [LinkEntry(url="https://www.youtube.com/watch?v=MRcjGT85OXY", kind="youtube")])
 
-    # remux_script check
-    cfg = load_config()
-    check("remux_script exists", cfg.remux_script.exists(), True)
+    # audio codec support check
+    check("audio supported ac3", is_audio_codec_supported("ac3"), True)
+    check("audio supported mp2", is_audio_codec_supported("mp2"), True)
+    check("audio supported mp3", is_audio_codec_supported("mp3"), True)
+    check("audio supported aac-lc", is_audio_codec_supported("aac", "LC"), True)
+    check("audio unsupported eac3", is_audio_codec_supported("eac3"), False)
+    check("audio unsupported dts", is_audio_codec_supported("dts"), False)
+    check("audio unsupported truehd", is_audio_codec_supported("truehd"), False)
+    check("audio unsupported flac", is_audio_codec_supported("flac"), False)
+
+    # subtitle codec support and filtering check
+    check("sub supported subrip", is_subtitle_codec_supported("subrip"), True)
+    check("sub supported mov_text", is_subtitle_codec_supported("mov_text"), True)
+    check("sub unsupported ass", is_subtitle_codec_supported("ass"), False)
+    check("sub unsupported pgs", is_subtitle_codec_supported("hdmv_pgs_subtitle"), False)
+    check("sub unsupported vobsub", is_subtitle_codec_supported("dvd_subtitle"), False)
+
+    test_subs = [
+        {"index": 2, "codec_name": "ass", "tags": {"language": "eng"}},
+        {"index": 3, "codec_name": "subrip", "tags": {"language": "spa"}},
+        {"index": 4, "codec_name": "subrip", "tags": {"language": "por"}},
+        {"index": 5, "codec_name": "subrip", "tags": {"language": "eng"}},
+        {"index": 6, "codec_name": "subrip", "tags": {"language": "fre"}},
+    ]
+    filtered = filter_subtitle_streams(test_subs, max_subs=3)
+    check("filter subs count", len(filtered), 3)
+    check("filter subs prioritizes por & eng", [s["index"] for s in filtered], [3, 4, 5])
 
     if failures:
         log.error("%d test(s) failed", failures)
@@ -2785,7 +2919,6 @@ def main() -> None:
         log.info("Input: %s", args.input_file)
     log.info("SSD buffer: %s", cfg.ssd_buffer)
     log.info("HDD target: %s/<category>/<show>/", cfg.hdd_mount)
-    log.info("Remux script: %s", cfg.remux_script)
     log.info("Max concurrent downloads: %d", cfg.max_concurrent)
     if cfg.best_quality:
         log.info("Best Quality Mode: enabled")
